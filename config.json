@@ -1,0 +1,30 @@
+{
+  "model": "qwen2.5:3b",
+  "voice_file": "voices/en_US-mei-high.onnx",
+  "tts_speed": 1.0,
+  "stt_model": "small.en",
+  "idle_timeout": 25.0,
+  "auto_ducking": true,
+  "duck_volume": 0.20,
+  "wake_phrases": [
+    "hey kiwi",
+    "hello kiwi",
+    "kiwi",
+    "yo kiwi",
+    "hi kiwi",
+    "okay kiwi"
+  ],
+  "sleep_phrases": [
+    "thank you",
+    "go to sleep",
+    "standby",
+    "enter standby",
+    "stop listening",
+    "be quiet",
+    "shut up",
+    "stop talking",
+    "goodnight",
+    "bye"
+  ]
+}
+

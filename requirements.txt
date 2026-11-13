@@ -1,0 +1,5 @@
+# Only needed for --speak / --voice. Text mode (python jarvis.py) needs nothing.
+faster-whisper>=1.0
+piper-tts>=1.8
+sounddevice>=0.4
+numpy
