@@ -106,11 +106,17 @@ AUTO_DUCKING   = bool(CONFIG.get("auto_ducking", True))
 DEFAULT_SPEED  = float(CONFIG.get("tts_speed", 1.0))
 DEFAULT_STT    = CONFIG.get("stt_model", "small.en")
 DEFAULT_VOICE  = os.path.join(HERE, CONFIG.get("voice_file", "voices/en_US-mei-high.onnx"))
+TTS_ENGINE     = CONFIG.get("tts_engine", "kokoro")
+DEFAULT_KOKORO_VOICE  = CONFIG.get("kokoro_voice", "af_heart")
+DEFAULT_KOKORO_MODEL  = os.path.join(HERE, CONFIG.get("kokoro_model", "voices/kokoro-v1.0.onnx"))
+DEFAULT_KOKORO_VOICES = os.path.join(HERE, CONFIG.get("kokoro_voices_file", "voices/voices-v1.0.bin"))
 
 SYSTEM_PROMPT = (
-    "You are Kiwi, a calm, witty, and concise AI assistant running locally on the user's Linux laptop. "
-    "Your replies are spoken aloud, so keep them to one or two short, direct sentences of plain text. "
-    "Never address the user as 'sir'. "
+    "You are Kiwi, a witty, intelligent, and natural AI companion running locally on the user's Linux laptop. "
+    "Your responses are spoken aloud via high-quality neural voice, so talk naturally like a real person in conversation. "
+    "Keep replies to 1 or 2 concise, punchy sentences. Be warm, direct, and conversational. "
+    "Never sound robotic, never use corporate clichés like 'How can I assist you today?', and never address the user as 'sir'. "
+    "Do not use markdown formatting, bullet points, asterisks, or lists in speech. "
     "You have tools to control laptop hardware (volume, brightness, night_light, media, spotify_play, "
     "media_info, lock_screen, take_screenshot, show_desktop, open_app, close_all_windows), "
     "access information (get_weather, system_status, battery_status, current_time, wifi_status, read_notifications), "
@@ -120,7 +126,7 @@ SYSTEM_PROMPT = (
     "When asked to remember a fact or recall what you remember, call remember or recall. "
     "Call a tool only when the user requests an action or live data. "
     "Never claim you performed an action unless a tool result confirms it. "
-    "For greetings or questions about whether you can hear, reply in plain text without tools."
+    "For casual chit-chat, greetings, or questions, reply naturally in plain conversational text without tools."
 )
 
 HELP = (
@@ -141,7 +147,7 @@ WAKE_PATTERN = re.compile(
 
 _SLEEP_LIST = CONFIG.get("sleep_phrases", [
     "thank you", "go to sleep", "standby", "enter standby", "stop listening",
-    "be quiet", "shut up", "stop talking", "goodnight", "bye"
+    "be quiet", "shut up", "stop talking", "goodnight", "bye", "stop", "stop it", "quiet"
 ])
 SLEEP_PATTERN = re.compile(
     r"\b(" + "|".join(re.escape(s).replace(r"\ ", r"\s+") for s in _SLEEP_LIST) + r"|^stop$)\b",
@@ -184,15 +190,14 @@ def extract_wake_remainder(text):
 
 
 def is_sleep_trigger(text):
-    """Return True if the user is asking Kiwi to sleep."""
+    """Return True if the user is asking Kiwi to sleep or stop."""
     # Ignore YouTube / podcast outros ("thanks for watching", etc.)
     if re.search(r"\bthanks?\s+for\s+(watching|listening|subscribing|coming|tuning)\b",
                  text, re.IGNORECASE):
         return False
-    # Long sentences without 'sleep'/'kiwi'/'standby' are probably ambient audio
-    if (len(text.split()) > 6
-            and not re.search(r"\b(sleep|stop\s+listening|kiwi|stand\s*by)\b", text, re.IGNORECASE)):
-        return False
+    # If the user says any variation of stop/quiet/shut up/sleep/standby
+    if re.search(r"\b(stop|stop it|stop talking|stop listening|be quiet|shut up|quiet|standby|stand by|go to sleep|sleep now)\b", text, re.IGNORECASE):
+        return True
     return bool(SLEEP_PATTERN.search(text))
 
 
@@ -764,6 +769,98 @@ class Out:
 
 
 # =============================================================================
+# Voice Stop Keyword Monitor
+# =============================================================================
+
+class VoiceStopMonitor:
+    """Continuously monitors microphone during LLM generation & TTS playback to stop on 'stop talking'."""
+
+    def __init__(self, ear, assistant=None):
+        self.ear = ear
+        self.assistant = assistant
+        self.stream = None
+        self.stop_event = threading.Event()
+        self.detected = threading.Event()
+        self.detected_text = ""
+        self._thread = None
+        import collections, numpy as np
+        self.ring = collections.deque(maxlen=48)  # ~1.5s rolling window (48 * 512 / 16000)
+        for _ in range(48):
+            self.ring.append(np.zeros(512, dtype=np.float32))
+        self.ring_lock = threading.Lock()
+
+    def __enter__(self):
+        if not self.ear or not hasattr(self.ear, "spotter"):
+            return self
+
+        def _mic_callback(indata, frames, time_info, status):
+            with self.ring_lock:
+                self.ring.append(indata[:, 0].copy())
+
+        try:
+            self.stream = self.ear.sd.InputStream(
+                samplerate=16000,
+                channels=1,
+                dtype="float32",
+                blocksize=512,
+                callback=_mic_callback,
+            )
+            self.stream.start()
+            self._thread = threading.Thread(target=self._spotter_loop, daemon=True)
+            self._thread.start()
+        except Exception:
+            self.stream = None
+        return self
+
+    def __exit__(self, *args):
+        self.stop_event.set()
+        if self._thread is not None:
+            self._thread.join(timeout=0.5)
+        if self.stream is not None:
+            try:
+                self.stream.stop()
+                self.stream.close()
+            except Exception:
+                pass
+            self.stream = None
+
+    def _spotter_loop(self):
+        import numpy as np
+        from voice import normalize_speech_text
+        while not self.stop_event.is_set():
+            if self.stop_event.wait(0.18):
+                break
+
+            with self.ring_lock:
+                audio = np.concatenate(list(self.ring))
+
+            rms = float(np.sqrt(np.mean(audio ** 2)))
+            if rms < 0.012:
+                continue
+
+            try:
+                segments, _ = self.ear.spotter.transcribe(
+                    audio,
+                    beam_size=1,
+                    temperature=0.0,
+                    vad_filter=False,
+                    language="en",
+                    initial_prompt="stop talking.",
+                )
+                raw_text = " ".join(s.text for s in segments).strip()
+                normalized = normalize_speech_text(raw_text)
+                # User command: only stop on "stop talking"
+                if re.search(r"\bstop\s+talking\b", normalized, re.IGNORECASE) or re.search(r"\bstop\s+talking\b", raw_text, re.IGNORECASE):
+                    self.detected_text = normalized or raw_text
+                    self.detected.set()
+                    if self.assistant:
+                        self.assistant._interrupt()
+                    break
+            except Exception:
+                pass
+
+
+# =============================================================================
 # Kiwi assistant state machine
 # =============================================================================
 
@@ -807,14 +904,8 @@ class KiwiAssistant:
             self.mouth.stop()
         self.out.reset()
 
-    def _wait_speech(self):
-        """Wait for mouth to finish speaking with multi-channel interruption.
-
-        Interruption channels:
-        1. Keyboard: any keypress in terminal (Enter, Space, Esc, s, q)
-        2. Desktop shortcut: SIGUSR1 signal (e.g. pkill -USR1 -f jarvis.py) or /tmp/kiwi_stop
-        3. Standard Ctrl+C
-        """
+    def _wait_speech(self, monitor=None):
+        """Wait for mouth to finish speaking with keyboard, voice, & desktop shortcut interruption."""
         if not self.mouth:
             return
 
@@ -828,18 +919,22 @@ class KiwiAssistant:
         try:
             with TerminalNonBlocking() as term:
                 while self.mouth.is_busy():
-                    # 1. Keyboard interrupt (any key in terminal)
+                    # 1. Voice stop keyword ("stop talking")
+                    if monitor and monitor.detected.is_set():
+                        return
+
+                    # 2. Keyboard interrupt (any key in terminal)
                     if term.check_key():
                         print("\n[Stopped via keyboard]", flush=True)
                         self._interrupt()
-                        break
+                        return
 
-                    # 2. Desktop shortcut trigger (SIGUSR1 or /tmp/kiwi_stop)
+                    # 3. Desktop shortcut trigger (SIGUSR1 or /tmp/kiwi_stop)
                     if _SIGUSR1_TRIGGERED:
                         _SIGUSR1_TRIGGERED = False
                         print("\n[Stopped via shortcut signal]", flush=True)
                         self._interrupt()
-                        break
+                        return
                     if os.path.exists(STOP_FILE):
                         try:
                             os.remove(STOP_FILE)
@@ -847,29 +942,36 @@ class KiwiAssistant:
                             pass
                         print("\n[Stopped via shortcut trigger]", flush=True)
                         self._interrupt()
-                        break
+                        return
 
-                    time.sleep(0.02)
+                    time.sleep(0.015)
         except KeyboardInterrupt:
             self._interrupt()
             print("\n(interrupted)")
         finally:
-            # Let ALSA hardware buffers fully drain and settle before mic capture opens
-            time.sleep(0.08)
+            time.sleep(0.03)
 
-    def _speak(self, text):
-        """Say text and wait for it to finish (interruptible, with automatic media ducking)."""
+    def _speak(self, text, enable_barge=True):
+        """Say text and wait for it to finish (interruptible via 'stop talking', keyboard, or shortcut)."""
         if self.mouth:
             self._interrupt_event.clear()
             self.out.interrupted = False
             if AUTO_DUCKING:
                 tools.duck_media()
+
+            monitor = VoiceStopMonitor(self.ear if (not self.push_to_talk and enable_barge) else None, assistant=self)
             try:
-                self.mouth.say(text)
-                self._wait_speech()
+                with monitor:
+                    self.mouth.say(text)
+                    self._wait_speech(monitor)
             finally:
                 if AUTO_DUCKING:
                     tools.unduck_media()
+
+            if monitor.detected.is_set():
+                heard = monitor.detected_text or "stop talking"
+                print(f"\n[Stopped: heard '{heard}']", flush=True)
+                self._go_to_sleep(silent=True)
 
     def _go_to_sleep(self, farewell=None, silent=False):
         """Transition to STANDBY. silent=True skips TTS (e.g. after Spotify starts)."""
@@ -879,11 +981,12 @@ class KiwiAssistant:
         if silent:
             play_cue("sleep")
             self.state = "STANDBY"
+            time.sleep(0.3)
         else:
             msg = farewell or random.choice(SLEEP_RESPONSES)
             print(f"kiwi> {msg}")
             play_cue("sleep")
-            self._speak(msg)
+            self._speak(msg, enable_barge=False)
             self.state = "STANDBY"
 
     # ------------------------------------------------------------------
@@ -931,13 +1034,16 @@ class KiwiAssistant:
         self.history.append({"role": "user", "content": query})
         if AUTO_DUCKING:
             tools.duck_media()
+
         try:
             self._interrupt_event.clear()
             self.out.interrupted = False
-            stats = run_turn(self.history, self.out, query, cancel_event=self._interrupt_event)
-            self.out.finish()
-            if self.mouth:
-                self._wait_speech()
+            monitor = VoiceStopMonitor(self.ear if not self.push_to_talk else None, assistant=self)
+            with monitor:
+                stats = run_turn(self.history, self.out, query, cancel_event=self._interrupt_event)
+                self.out.finish()
+                if self.mouth:
+                    self._wait_speech(monitor)
             count = (stats or {}).get("eval_count")
             nanos = (stats or {}).get("eval_duration")
             if count and nanos:
@@ -953,6 +1059,12 @@ class KiwiAssistant:
         finally:
             if AUTO_DUCKING:
                 tools.unduck_media()
+
+        if monitor.detected.is_set():
+            heard = monitor.detected_text or "stop talking"
+            print(f"\n[Stopped: heard '{heard}']", flush=True)
+            self._go_to_sleep(silent=True)
+
         self._trim_history()
         if auto_standby or any(
             c.get("function", {}).get("name") == "spotify_play"
@@ -1010,12 +1122,7 @@ class KiwiAssistant:
         # ACTIVE — listen and respond
         print("\n[Listening... speak freely]", flush=True)
 
-        def on_speech_start():
-            if self.mouth and self.mouth.is_speaking():
-                self.mouth.stop()
-
-        audio = self.ear.record_vad(
-            silence_duration=0.5, max_seconds=8.0, on_speech_start=on_speech_start)
+        audio = self.ear.record_vad(silence_duration=0.5, max_seconds=8.0)
         if audio.size == 0:
             if time.time() - self.last_active > self.idle_timeout:
                 self._go_to_sleep()
@@ -1121,6 +1228,14 @@ def main():
                         help=f"Ollama model (default: {MODEL})")
     parser.add_argument("--stt-model", default=DEFAULT_STT,
                         help=f"Whisper model: tiny.en, base.en, small.en, medium.en (default: {DEFAULT_STT})")
+    parser.add_argument("--tts-engine", default=TTS_ENGINE, choices=["kokoro", "piper"],
+                        help=f"TTS engine: kokoro or piper (default: {TTS_ENGINE})")
+    parser.add_argument("--kokoro-voice", default=DEFAULT_KOKORO_VOICE,
+                        help=f"Kokoro voice: af_heart, af_sky, af_bella, am_adam, bm_george (default: {DEFAULT_KOKORO_VOICE})")
+    parser.add_argument("--kokoro-model", default=DEFAULT_KOKORO_MODEL,
+                        help=f"Kokoro ONNX model path (default: {DEFAULT_KOKORO_MODEL})")
+    parser.add_argument("--kokoro-voices", default=DEFAULT_KOKORO_VOICES,
+                        help=f"Kokoro voices bin path (default: {DEFAULT_KOKORO_VOICES})")
     parser.add_argument("--voice-file", default=DEFAULT_VOICE,
                         help=f"Piper voice .onnx file path (default: {DEFAULT_VOICE})")
     parser.add_argument("--tts-speed", type=float, default=DEFAULT_SPEED,
@@ -1134,7 +1249,14 @@ def main():
     if args.voice or args.speak:
         from voice import Ear, Mouth, SentenceBuffer, VoiceError
         try:
-            mouth     = Mouth(args.voice_file, speed=args.tts_speed)
+            mouth = Mouth(
+                voice_path=args.voice_file,
+                engine=args.tts_engine,
+                kokoro_voice=args.kokoro_voice,
+                kokoro_model=args.kokoro_model,
+                kokoro_voices_file=args.kokoro_voices,
+                speed=args.tts_speed,
+            )
             sentences = SentenceBuffer()
             if args.voice:
                 ear = Ear(args.stt_model)
@@ -1156,7 +1278,8 @@ def main():
         else "speak"                        if mouth
         else "text"
     )
-    print(f"Kiwi  |  model: {MODEL}  |  {len(tools.REGISTRY)} tools  |  mode: {mode_label}")
+    tts_desc = f"Kokoro ({mouth.kokoro_voice})" if mouth and mouth.engine == "kokoro" else f"Piper ({os.path.basename(args.voice_file)})" if mouth else "none"
+    print(f"Kiwi  |  model: {MODEL}  |  tts: {tts_desc}  |  {len(tools.REGISTRY)} tools  |  mode: {mode_label}")
     print(HELP)
 
     assistant = KiwiAssistant(

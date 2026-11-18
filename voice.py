@@ -1,7 +1,7 @@
 """Voice I/O for Jarvis: hands-free / push-to-talk speech-to-text and streaming TTS.
 
 Ear   = faster-whisper (GPU/CPU), domain biasing, confidence filtering, speech normalization
-Mouth = Piper TTS with streaming playback and responsive cancellation
+Mouth = Kokoro-82M (state-of-the-art neural TTS) / Piper TTS with streaming playback and responsive cancellation
 """
 
 import collections
@@ -72,6 +72,10 @@ _ACOUSTIC_FIXES = [
     (r"\bwhether\s+(in|for|today|forecast)",  r"weather \1"),
     (r"\bpaid softs\b",                      "best shops"),
 
+    # --- Stop talking fixes ---
+    (r"\bstop\s+(?:talk\s*in|talken|talkin)\b", "stop talking"),
+    (r"\bstop\s+it\s+talking\b",               "stop talking"),
+
     # --- Kiwi / name mishearings ---
     (r"\b(?:qiwi|keewee|keywee|kee[- ]wee|kewee|kwee|key\s*we)\b", "Kiwi"),
     (r"\b(?:Travis|Jarves|Jarbus|Jarvus|Jervis)\b",               "Kiwi"),
@@ -130,6 +134,13 @@ class VoiceError(Exception):
 def _import_sounddevice():
     try:
         import sounddevice
+        # Route through Pulse/PipeWire software mixer to eliminate ALSA mmap buffer collisions
+        devices = sounddevice.query_devices()
+        dev_names = [d["name"].lower() for d in devices]
+        if "pulse" in dev_names:
+            sounddevice.default.device = "pulse"
+        elif "pipewire" in dev_names:
+            sounddevice.default.device = "pipewire"
     except OSError as e:
         raise VoiceError("PortAudio not found. Install it with: sudo pacman -S portaudio") from e
     except ImportError as e:
@@ -164,6 +175,7 @@ def play_cue(kind="wake"):
 # ---------------------------------------------------------------------------
 
 _SENTENCE_END = re.compile(r"(?<=[.!?])\s+|\n+")
+_CLAUSE_END = re.compile(r"(?<=[,;:])\s+")
 _EMOJI = re.compile("[\U00010000-\U0010ffff☀-➿️]")
 
 
@@ -194,28 +206,42 @@ def clean_for_speech(text):
 
 
 class SentenceBuffer:
-    """Collects streamed LLM tokens and hands back complete sentences for TTS.
+    """Collects streamed LLM tokens and hands back complete sentences / clauses for TTS.
 
-    min_len=3 ensures we start speaking almost immediately once a sentence
-    boundary (period, !, ?) is encountered, dramatically reducing the delay
-    between text appearing on screen and being spoken aloud.
+    min_len=3 ensures sentence boundaries (. ! ?) are respected.
+    clause_min_len=28 allows long clauses (, ;) to start speaking early,
+    eliminating the awkward latency gap before Kiwi begins talking.
     """
 
-    def __init__(self, min_len=3):
+    def __init__(self, min_len=3, clause_min_len=28):
         self.buf = ""
         self.min_len = min_len
+        self.clause_min_len = clause_min_len
 
     def feed(self, text):
         self.buf += text
         sentences = []
         while True:
-            for match in _SENTENCE_END.finditer(self.buf):
-                if match.start() >= self.min_len:
-                    sentences.append(self.buf[:match.start()].strip())
-                    self.buf = self.buf[match.end():]
-                    break
-            else:
-                return [s for s in sentences if s]
+            # 1. Period / exclamation / question / newline boundary
+            m_sent = _SENTENCE_END.search(self.buf)
+            if m_sent and m_sent.start() >= self.min_len:
+                chunk = self.buf[:m_sent.start()].strip()
+                self.buf = self.buf[m_sent.end():]
+                if chunk:
+                    sentences.append(chunk)
+                continue
+
+            # 2. Clause boundary (, ; :) if enough characters have accumulated
+            m_clause = _CLAUSE_END.search(self.buf)
+            if m_clause and m_clause.start() >= self.clause_min_len:
+                chunk = self.buf[:m_clause.start()].strip()
+                self.buf = self.buf[m_clause.end():]
+                if chunk:
+                    sentences.append(chunk)
+                continue
+
+            break
+        return sentences
 
     def flush(self):
         rest, self.buf = self.buf.strip(), ""
@@ -261,6 +287,39 @@ class Ear:
         )
         self._device = device
         self.language = language
+
+        # Ultra-fast keyword spotter model (tiny.en, ~39MB) for real-time "stop talking" detection
+        try:
+            self.spotter = WhisperModel(
+                "tiny.en",
+                device="cpu",
+                compute_type="int8",
+                cpu_threads=min(os.cpu_count() or 4, 4),
+                num_workers=1,
+            )
+        except Exception:
+            self.spotter = self.model
+
+    def check_stop_keyword(self, audio):
+        """Spot 'stop talking' phrase (<0.25s) to interrupt speech on explicit user request."""
+        if audio.size < SAMPLE_RATE * 0.20:
+            return None
+        try:
+            segments, _ = self.spotter.transcribe(
+                audio,
+                beam_size=1,
+                temperature=0.0,
+                vad_filter=False,
+                language="en",
+                initial_prompt="stop talking.",
+            )
+            raw_text = " ".join(s.text for s in segments).strip()
+            norm = normalize_speech_text(raw_text)
+            if re.search(r"\bstop\s+talking\b", norm, re.IGNORECASE) or re.search(r"\bstop\s+talking\b", raw_text, re.IGNORECASE):
+                return norm or raw_text
+        except Exception:
+            pass
+        return None
 
     def record_vad(self, silence_duration=0.7, max_seconds=8.0, on_speech_start=None):
         """Record with ambient noise calibration and automatic end-of-speech detection."""
@@ -416,38 +475,109 @@ class Ear:
 
 
 # ---------------------------------------------------------------------------
-# Text-to-speech  (Piper)
+# Text-to-speech  (Kokoro-82M / Piper)
 # ---------------------------------------------------------------------------
 
-class Mouth:
-    """Speaks queued sentences on a background thread with clean PortAudio stream lifecycle."""
+def _split_clauses(text, target_len=55):
+    """Split text into conversational phrase chunks for low-latency TTS synthesis."""
+    if len(text) <= target_len:
+        return [text]
+    parts = re.split(r"(?<=[,;:\n])\s+", text)
+    if len(parts) <= 1:
+        parts = re.split(r"(?<=[.!?])\s+", text)
+    if len(parts) <= 1:
+        return [text]
 
-    def __init__(self, voice_path, speed=1.0):
-        if not os.path.exists(voice_path):
-            raise VoiceError(
-                f"Voice file not found: {voice_path}\n"
-                "Download one with:\n"
-                "  python -m piper.download_voices en_GB-alan-medium --download-dir voices"
-            )
+    chunks = []
+    curr = ""
+    for part in parts:
+        part = part.strip()
+        if not part:
+            continue
+        if not curr:
+            curr = part
+        elif len(curr) + len(part) + 1 <= target_len:
+            curr += " " + part
+        else:
+            chunks.append(curr)
+            curr = part
+    if curr:
+        chunks.append(curr)
+    return chunks
+
+
+class Mouth:
+    """Speaks queued sentences on a background thread with clean PortAudio stream lifecycle.
+    
+    Supports:
+    - Kokoro-82M (engine='kokoro'): State-of-the-art neural TTS, 24kHz, human cadence.
+    - Piper (engine='piper'): Lightweight fast ONNX TTS.
+    """
+
+    def __init__(self, voice_path=None, engine="kokoro", kokoro_voice="af_heart",
+                 kokoro_model="voices/kokoro-v1.0.onnx", kokoro_voices_file="voices/voices-v1.0.bin",
+                 speed=1.0):
+        self.engine = (engine or "kokoro").lower()
+        self.speed = speed
+        self.kokoro_voice = kokoro_voice or "af_heart"
+        self.kokoro_model = kokoro_model
+        self.kokoro_voices_file = kokoro_voices_file
+        self.voice_path = voice_path
         self.sd = _import_sounddevice()
-        try:
-            from piper import PiperVoice
-            from piper.config import SynthesisConfig
-        except ImportError as e:
-            raise VoiceError("Missing Python packages. Run: pip install -r requirements.txt") from e
-        self.voice = PiperVoice.load(voice_path)
-        self.rate = self.voice.config.sample_rate
-        # Natural synthesis configuration with human prosody
-        self._syn_config = SynthesisConfig(
-            length_scale=speed,
-            noise_scale=0.667,
-            noise_w_scale=0.8,
-        )
         self._queue = queue.Queue()
         self._cancel = threading.Event()
         self._is_speaking = threading.Event()
         self._current_stream = None
         self._stream_lock = threading.Lock()
+
+        # Check if Kokoro is requested
+        if self.engine == "kokoro":
+            if not os.path.exists(kokoro_model) or not os.path.exists(kokoro_voices_file):
+                # Fallback to piper if piper voice file exists
+                if voice_path and os.path.exists(voice_path):
+                    print(f"  [Kokoro model missing, falling back to Piper: {voice_path}]", flush=True)
+                    self.engine = "piper"
+                else:
+                    raise VoiceError(
+                        f"Kokoro model or voices file not found:\n"
+                        f"  Model: {kokoro_model}\n"
+                        f"  Voices: {kokoro_voices_file}"
+                    )
+
+        if self.engine == "kokoro":
+            try:
+                from kokoro_onnx import Kokoro
+            except ImportError as e:
+                raise VoiceError("Missing kokoro-onnx package. Run: pip install kokoro-onnx soundfile") from e
+            self.kokoro = Kokoro(kokoro_model, kokoro_voices_file)
+            self.rate = 24000
+            self.dtype = "float32"
+            # Pre-warm ONNX session so first spoken response starts instantly
+            try:
+                self.kokoro.create("warm", voice=self.kokoro_voice, speed=1.0, lang="en-us")
+            except Exception:
+                pass
+        else:
+            if not voice_path or not os.path.exists(voice_path):
+                raise VoiceError(
+                    f"Piper voice file not found: {voice_path}\n"
+                    "Download one with:\n"
+                    "  python -m piper.download_voices en_GB-alan-medium --download-dir voices"
+                )
+            try:
+                from piper import PiperVoice
+                from piper.config import SynthesisConfig
+            except ImportError as e:
+                raise VoiceError("Missing piper-tts package. Run: pip install piper-tts") from e
+            self.voice = PiperVoice.load(voice_path)
+            self.rate = self.voice.config.sample_rate
+            self.dtype = "int16"
+            self._syn_config = SynthesisConfig(
+                length_scale=speed,
+                noise_scale=0.667,
+                noise_w_scale=0.8,
+            )
+
         threading.Thread(target=self._worker, daemon=True).start()
 
     def is_speaking(self):
@@ -460,7 +590,8 @@ class Mouth:
 
     def say(self, text):
         text = clean_for_speech(text)
-        if text and not self._cancel.is_set():
+        if text:
+            self._cancel.clear()
             self._queue.put(text)
 
     def wait(self):
@@ -470,23 +601,12 @@ class Mouth:
     def stop(self):
         """Cut off speech immediately, abort playback, and discard queued speech."""
         self._cancel.set()
-        try:
-            while True:
+        while True:
+            try:
                 self._queue.get_nowait()
                 self._queue.task_done()
-        except queue.Empty:
-            pass
-
-        # Instantly abort the active audio stream so sound stops immediately
-        with self._stream_lock:
-            if self._current_stream is not None:
-                try:
-                    self._current_stream.abort()
-                except Exception:
-                    pass
-
-        self._queue.join()
-        self._cancel.clear()
+            except queue.Empty:
+                break
         self._is_speaking.clear()
 
     def _worker(self):
@@ -494,32 +614,108 @@ class Mouth:
             text = self._queue.get()
             if not text or self._cancel.is_set():
                 self._queue.task_done()
+                if self._queue.empty():
+                    self._cancel.clear()
+                    self._is_speaking.clear()
                 continue
             self._is_speaking.set()
             try:
                 self._speak(text)
             except Exception as e:
-                print(f"\n[speech error] {e}", flush=True)
+                if not self._cancel.is_set():
+                    print(f"\n[speech error] {e}", flush=True)
             finally:
                 self._is_speaking.clear()
                 self._queue.task_done()
+                if self._queue.empty():
+                    self._cancel.clear()
 
-    def _speak(self, text):
+    def _play_array_callback(self, samples):
+        """Play a numpy audio array via thread-safe non-blocking callback (no ALSA crashes on cancel)."""
+        if self._cancel.is_set() or len(samples) == 0:
+            return
+
+        import threading
+        pos = 0
+        total_samples = len(samples)
+        done = threading.Event()
+
+        def callback(outdata, frames, time_info, status):
+            nonlocal pos
+            if self._cancel.is_set() or pos >= total_samples:
+                outdata.fill(0)
+                raise self.sd.CallbackStop()
+
+            chunk = samples[pos:pos + frames]
+            pos += len(chunk)
+            if len(chunk) < frames:
+                outdata[:len(chunk), 0] = chunk
+                outdata[len(chunk):, 0] = 0
+                raise self.sd.CallbackStop()
+            else:
+                outdata[:, 0] = chunk
+
         try:
-            with self.sd.OutputStream(samplerate=self.rate, channels=1, dtype="int16") as out:
+            with self.sd.OutputStream(samplerate=self.rate, channels=1, dtype=self.dtype,
+                                      callback=callback, finished_callback=done.set) as stream:
                 with self._stream_lock:
-                    self._current_stream = out
-                for chunk in self.voice.synthesize(text, syn_config=self._syn_config):
+                    self._current_stream = stream
+                while not done.is_set():
                     if self._cancel.is_set():
-                        return
-                    audio = chunk.audio_int16_array
-                    for start in range(0, len(audio), 1024):
-                        if self._cancel.is_set():
-                            return
-                        try:
-                            out.write(audio[start:start + 1024])
-                        except Exception:
-                            return
+                        break
+                    done.wait(timeout=0.02)
+        except self.sd.PortAudioError:
+            pass
         finally:
             with self._stream_lock:
                 self._current_stream = None
+
+    def _speak(self, text):
+        if self.engine == "kokoro":
+            self._speak_kokoro(text)
+        else:
+            self._speak_piper(text)
+
+    def _speak_kokoro(self, text):
+        if self._cancel.is_set():
+            return
+        chunks = _split_clauses(text)
+        for chunk in chunks:
+            if self._cancel.is_set():
+                return
+            try:
+                samples, _sr = self.kokoro.create(
+                    chunk,
+                    voice=self.kokoro_voice,
+                    speed=self.speed,
+                    lang="en-us",
+                )
+            except Exception as e:
+                if not self._cancel.is_set():
+                    print(f"\n[Kokoro synthesis error] {e}", flush=True)
+                return
+
+            if self._cancel.is_set() or len(samples) == 0:
+                continue
+
+            if samples.ndim > 1:
+                samples = samples.flatten()
+
+            self._play_array_callback(samples)
+
+    def _speak_piper(self, text):
+        if self._cancel.is_set():
+            return
+        try:
+            import numpy as np
+            chunks = []
+            for chunk in self.voice.synthesize(text, syn_config=self._syn_config):
+                if self._cancel.is_set():
+                    return
+                chunks.append(chunk.audio_int16_array)
+            if chunks:
+                audio = np.concatenate(chunks)
+                self._play_array_callback(audio)
+        except Exception as e:
+            if not self._cancel.is_set():
+                print(f"\n[Piper error] {e}", flush=True)

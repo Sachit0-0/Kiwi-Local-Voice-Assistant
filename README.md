@@ -1,7 +1,7 @@
 # Kiwi 🥝
 
 > **A fast, completely local, privacy-first AI voice assistant for Linux.**  
-> Powered by **Ollama (`qwen2.5:3b`)**, **Faster-Whisper**, **Piper Neural TTS**, and direct **Linux desktop controls** (KDE Plasma, PipeWire, WirePlumber).
+> Powered by **Ollama (`qwen2.5:3b`)**, **Faster-Whisper**, **Kokoro-82M Neural TTS** (with Piper fallback), and direct **Linux desktop controls** (KDE Plasma, PipeWire, WirePlumber).
 
 No cloud APIs. No telemetry. No subscriptions. Everything runs locally on your machine.
 
@@ -11,7 +11,7 @@ No cloud APIs. No telemetry. No subscriptions. Everything runs locally on your m
 
 - 🧠 **Local Brain**: Uses Ollama (`qwen2.5:3b` by default; fits comfortably on a 4 GB laptop GPU or runs on CPU).
 - 🎙️ **Instant Ear (STT)**: Faster-Whisper with Silero Voice Activity Detection (VAD) and acoustic domain vocabulary priming.
-- 🗣️ **Natural Neural Voice (TTS)**: Piper TTS streaming high-fidelity 32 kHz neural speech (Mei US High), featuring whole-clause prosody and automatic unit expansion (`°C`, `km/h`, `$`, `%`).
+- 🗣️ **Ultra-Realistic Neural Voice (TTS)**: **Kokoro-82M** (82M parameters, 24 kHz) producing warm, natural human-level speech with realistic pacing and intonation (`af_heart`, `af_sky`, `af_bella`, `am_adam`, `bm_george`).
 - ⚡ **Sub-50ms Fast-Path Router**: Deterministic regex routing executes common hardware commands (volume, brightness, music, weather, desktop) instantly in `< 1 ms` without waiting for LLM token generation.
 - 🎵 **Smart Media Ducking**: Automatically drops Spotify, YouTube, and VLC volume to 20% whenever you converse with Kiwi, and smoothly restores volume when done.
 - 🧠 **Persistent Memory**: Remembers facts and preferences across reboots and sessions via `memory.json`.
@@ -67,15 +67,22 @@ Ensure Ollama is running (`ollama serve`), then pull the default model:
 ollama pull qwen2.5:3b
 ```
 
-### 4. Download the Neural Voice Model
-Download the high-fidelity **Mei (US High 32kHz)** voice model into the `voices/` directory:
+### 4. Download Neural Voice Models
+
+#### Kokoro-82M (Default & Recommended)
+Download the Kokoro ONNX model (82M params, 24kHz) and voice embeddings:
 ```bash
 mkdir -p voices
+curl -L -o voices/kokoro-v1.0.onnx https://github.com/thewh1teagle/kokoro-onnx/releases/download/model-files-v1.1/kokoro-v1.0.onnx
+curl -L -o voices/voices-v1.0.bin https://github.com/thewh1teagle/kokoro-onnx/releases/download/model-files-v1.1/voices-v1.0.bin
+```
+
+#### Piper TTS (Optional Fallback)
+If you also want lightweight Piper voices:
+```bash
 curl -L -o voices/en_US-mei-high.onnx "https://huggingface.co/VINUK/piper-gpl-revamped-voices/resolve/main/en/en_US/mei/high_extened/en_US-mei-high.onnx"
 curl -L -o voices/en_US-mei-high.onnx.json "https://huggingface.co/VINUK/piper-gpl-revamped-voices/resolve/main/en/en_US/mei/high_extened/en_US-mei-high.onnx.json"
 ```
-
-*(Optional: You can also use standard Piper voices like `en_GB-alan-medium` via `python -m piper.download_voices en_GB-alan-medium --download-dir voices`)*
 
 ---
 
@@ -152,6 +159,11 @@ Configure Kiwi parameters in `config.json` without modifying any Python code:
 ```json
 {
   "model": "qwen2.5:3b",
+  "tts_engine": "kokoro",
+  "kokoro_voice": "af_heart",
+  "kokoro_speed": 1.0,
+  "kokoro_model": "voices/kokoro-v1.0.onnx",
+  "kokoro_voices_file": "voices/voices-v1.0.bin",
   "voice_file": "voices/en_US-mei-high.onnx",
   "tts_speed": 1.0,
   "stt_model": "small.en",
@@ -168,7 +180,16 @@ Configure Kiwi parameters in `config.json` without modifying any Python code:
 }
 ```
 
-CLI flags (e.g. `--model`, `--voice-file`, `--tts-speed`) override settings in `config.json`.
+### Popular Kokoro Voices:
+- `af_heart` (Default – warm, natural, female)
+- `af_sky` (Clear, conversational, female)
+- `af_bella` (Expressive, female)
+- `am_adam` (Smooth, natural, male)
+- `am_michael` (Warm, male)
+- `bf_emma` (British female)
+- `bm_george` (British male)
+
+CLI flags (e.g. `--tts-engine`, `--kokoro-voice`, `--model`, `--tts-speed`) override settings in `config.json`.
 
 ---
 
@@ -200,12 +221,12 @@ python tools.py read_notifications
 
 ```
 ├── jarvis.py          # Main entry point & state machine (KiwiAssistant)
-├── voice.py           # Faster-Whisper STT engine & Piper TTS streaming Mouth
+├── voice.py           # Faster-Whisper STT engine & Kokoro-82M / Piper streaming Mouth
 ├── tools.py           # 21 PC control tools, ducking engine, & persistent memory
-├── config.json        # Central configuration (models, speed, wake/sleep words)
+├── config.json        # Central configuration (models, speed, voices, wake/sleep words)
 ├── requirements.txt   # Python dependencies
 ├── .gitignore         # Ignores large neural models, caches, and user data
-└── voices/            # Local neural voice ONNX models
+└── voices/            # Local neural voice ONNX models (Kokoro-82M, Piper)
 ```
 
 ---
@@ -213,4 +234,3 @@ python tools.py read_notifications
 ## 📜 License & Disclaimer
 
 This is a personal hobby project built for personal Linux productivity and experimentation. Distributed under the MIT License. Feel free to fork, experiment, and customize it for your desktop setup!
-# Kiwi-Local-Voice-Assistant

@@ -1,5 +1,10 @@
 {
   "model": "qwen2.5:3b",
+  "tts_engine": "kokoro",
+  "kokoro_voice": "af_heart",
+  "kokoro_speed": 1.0,
+  "kokoro_model": "voices/kokoro-v1.0.onnx",
+  "kokoro_voices_file": "voices/voices-v1.0.bin",
   "voice_file": "voices/en_US-mei-high.onnx",
   "tts_speed": 1.0,
   "stt_model": "small.en",
